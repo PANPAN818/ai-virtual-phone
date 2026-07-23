@@ -66,6 +66,14 @@ import {
 } from "@/lib/generated-image-retry";
 import { scrollElementWithinContainer } from "@/lib/dom-scroll";
 import { ChatFallbackAvatar } from "./chat-fallback-avatar";
+import { ChatScreenEffectOverlay, type ActiveScreenEffect } from "./chat-screen-effect";
+import {
+    consumePendingChatDiceFace,
+    formatChatDiceResultMessage,
+    matchChatScreenEffectRule,
+    rollChatDiceFace,
+    setPendingChatDiceFace,
+} from "@/lib/chat-screen-effects";
 import { abortableDelay, throwIfAborted } from "@/lib/abort-utils";
 import { GROUP_SELF_KEY, canGroupAdminAct, applyGroupAdminAction, buildGroupAdminNoticeText, getGroupMemberDisplayName, getGroupMuteRemainingMs, getGroupRole, isGroupMuted, formatMuteRemainingLabel, resolveGroupMemberKeyByName, type GroupAdminAction } from "@/lib/group-admin";
 
@@ -823,7 +831,14 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
             )}
 
             {showEmojiPanel && (
-                <EmojiPanel onSelect={(emoji) => appendText(emoji, { focus: false })} />
+                <EmojiPanel
+                    onSelect={(emoji) => appendText(emoji, { focus: false })}
+                    onEffectSend={(text) => {
+                        if (inputLocked || isGenerating) return;
+                        onSendText(text);
+                        onClosePanels();
+                    }}
+                />
             )}
 
             {showStickerPanel && (
@@ -1067,6 +1082,44 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
     const [bgLoading, setBgLoading] = useState(!!session.backgroundImage);
 
     const wrapperRef = useRef<HTMLDivElement>(null);
+
+    // 全屏特效：命中触发词的新消息播放表情雨/礼花（微信同款）
+    const [activeScreenEffect, setActiveScreenEffect] = useState<ActiveScreenEffect | null>(null);
+    const screenFxSeenRef = useRef<Set<string>>(new Set());
+    const screenFxMountedAtRef = useRef(Date.now());
+
+    useEffect(() => {
+        const seen = screenFxSeenRef.current;
+        let fired = activeScreenEffect !== null;
+        for (const msg of messages) {
+            if (seen.has(msg.id)) continue;
+            seen.add(msg.id);
+            if (fired) continue;
+            if (msg.role !== "user" && msg.role !== "assistant") continue;
+            if (msg.mediaType || !msg.content) continue;
+            // 只对本次打开聊天室之后产生的消息生效，历史加载/翻页不触发
+            if (new Date(msg.createdAt).getTime() < screenFxMountedAtRef.current) continue;
+            const hit = matchChatScreenEffectRule(msg.content);
+            if (!hit) continue;
+            let diceFace: number | undefined;
+            if (hit.effect === "dice") {
+                // 发送管线可能已掷好点数；角色触发时在这里掷，并写旁白公布结果
+                diceFace = consumePendingChatDiceFace() ?? undefined;
+                if (diceFace === undefined) {
+                    diceFace = rollChatDiceFace();
+                    const diceMsg = pushChatMessage({
+                        sessionId: session.id,
+                        role: "system",
+                        content: formatChatDiceResultMessage(diceFace),
+                    });
+                    setMessages(prev => [...prev, diceMsg]);
+                }
+            }
+            setActiveScreenEffect({ runId: msg.id, ...hit, diceFace });
+            fired = true;
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [messages]);
 
     useEffect(() => {
         if (!session.backgroundImage) {
@@ -2918,7 +2971,13 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         errorPrefix = "发送失败",
         onDecline,
     }: ManagedGenerationOptions) => {
-        if (isGeneratingRef.current) return;
+        if (isGeneratingRef.current) {
+            if (activeGenerationRuns.has(session.id)) return;
+            // 上一轮被外部取消/顶替后收尾提前返回过，标记已是陈旧状态：复位后继续本次请求
+            isGeneratingRef.current = false;
+            setIsGenerating(false);
+            clearGenerationLock(session.id);
+        }
 
         const generationRun = createGenerationRun(session.id);
         const generationRunId = generationRun.runId;
@@ -2971,12 +3030,19 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
             });
             setMessages(prev => [...prev, errorMsg]);
         } finally {
-            if (!finishGenerationRun(session.id, generationRunId)) return;
-            isGeneratingRef.current = false;
-            setIsGenerating(false);
-            clearGenerationLock(session.id);
-            if (!mountedRef.current) {
-                window.dispatchEvent(new CustomEvent(CHAT_BG_COMPLETE, { detail: { sessionId: session.id } }));
+            if (finishGenerationRun(session.id, generationRunId)) {
+                isGeneratingRef.current = false;
+                setIsGenerating(false);
+                clearGenerationLock(session.id);
+                if (!mountedRef.current) {
+                    window.dispatchEvent(new CustomEvent(CHAT_BG_COMPLETE, { detail: { sessionId: session.id } }));
+                }
+            } else if (!activeGenerationRuns.has(session.id)) {
+                // 本轮被外部取消且没有新一轮接手：仍需复位，否则「生成中」标记永久卡死，
+                // 后续联动/追问的回复请求会被静默吞掉
+                isGeneratingRef.current = false;
+                setIsGenerating(false);
+                clearGenerationLock(session.id);
             }
         }
 
@@ -3201,7 +3267,13 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
     };
 
     const triggerAIResponse = async () => {
-        if (isGeneratingRef.current) return;
+        if (isGeneratingRef.current) {
+            if (activeGenerationRuns.has(session.id)) return;
+            // 上一轮被外部取消/顶替后收尾提前返回过，标记已是陈旧状态：复位后继续本次请求
+            isGeneratingRef.current = false;
+            setIsGenerating(false);
+            clearGenerationLock(session.id);
+        }
         const generationRun = createGenerationRun(session.id);
         const generationRunId = generationRun.runId;
         const isCurrentGeneration = () => isGenerationRunActive(session.id, generationRunId);
@@ -3441,18 +3513,25 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
             });
             setMessages(prev => [...prev, errorMsg]);
         } finally {
-            if (!finishGenerationRun(session.id, generationRunId)) return;
-            isGeneratingRef.current = false;
-            setIsGenerating(false);
-            clearGenerationLock(session.id);
-            if (!mountedRef.current) {
-                window.dispatchEvent(new CustomEvent(CHAT_BG_COMPLETE, { detail: { sessionId: session.id } }));
-            }
-            // If user sent more messages while AI was generating, show the generate button again
-            const latestMsgs = loadChatMessages(session.id);
-            const last = latestMsgs[latestMsgs.length - 1];
-            if (last && last.role === "user") {
-                setPendingGenerate(true);
+            if (finishGenerationRun(session.id, generationRunId)) {
+                isGeneratingRef.current = false;
+                setIsGenerating(false);
+                clearGenerationLock(session.id);
+                if (!mountedRef.current) {
+                    window.dispatchEvent(new CustomEvent(CHAT_BG_COMPLETE, { detail: { sessionId: session.id } }));
+                }
+                // If user sent more messages while AI was generating, show the generate button again
+                const latestMsgs = loadChatMessages(session.id);
+                const last = latestMsgs[latestMsgs.length - 1];
+                if (last && last.role === "user") {
+                    setPendingGenerate(true);
+                }
+            } else if (!activeGenerationRuns.has(session.id)) {
+                // 本轮被外部取消且没有新一轮接手：仍需复位，否则「生成中」标记永久卡死，
+                // 后续联动/追问的回复请求会被静默吞掉
+                isGeneratingRef.current = false;
+                setIsGenerating(false);
+                clearGenerationLock(session.id);
             }
         }
         if (shouldRunDeclineReply) await triggerReply();
@@ -3464,6 +3543,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                 sessionId?: string;
                 characterId?: string;
                 handled?: boolean;
+                busy?: boolean;
             }>).detail;
             const requestSessionId = typeof detail?.sessionId === "string" ? detail.sessionId : "";
             const requestCharacterId = typeof detail?.characterId === "string" ? detail.characterId : "";
@@ -3474,6 +3554,11 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
 
             if (detail) detail.handled = true;
             syncMessagesFromStorage();
+            // 真在生成中：如实告知调用方（避免记成「已生成回应」），本轮结束后 pendingGenerate 兜底
+            if (isGeneratingRef.current && activeGenerationRuns.has(session.id)) {
+                if (detail) detail.busy = true;
+                return;
+            }
             void triggerAIResponse();
         };
 
@@ -3528,6 +3613,17 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         });
 
         setMessages(prev => [...prev, newMsg]);
+        // 掷骰子：点数在进入生成前掷好并写成旁白，让角色本轮就能对结果做出回应
+        if (matchChatScreenEffectRule(currentText)?.effect === "dice") {
+            const face = rollChatDiceFace();
+            setPendingChatDiceFace(face);
+            const diceMsg = pushChatMessage({
+                sessionId: session.id,
+                role: "system",
+                content: formatChatDiceResultMessage(face),
+            });
+            setMessages(prev => [...prev, diceMsg]);
+        }
         setPendingGenerate(true);
         return true;
     };
@@ -4826,6 +4922,9 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
             {liveCSS && (
                 <style dangerouslySetInnerHTML={{ __html: scopeSessionCSS(liveCSS, `.session-${session.id}`) }} />
             )}
+
+            {/* 全屏特效层（表情雨/礼花），不拦截任何触摸操作 */}
+            <ChatScreenEffectOverlay active={activeScreenEffect} onDone={() => setActiveScreenEffect(null)} />
             {/* Header */}
             <header className="page-header chat-room-main-pane" data-ui="header">
                 <div className="page-header-safe-area" />

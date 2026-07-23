@@ -1,7 +1,7 @@
 "use client";
 
 import { forwardRef, Fragment, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL_VISIBLE_MESSAGE_COUNT, CHAT_LOAD_MORE_MESSAGE_COUNT, CHAT_REQUEST_REPLY_EVENT, loadChatAppSettings, loadChatMessages, loadChatContacts, loadChatSessions, saveChatSessions, pushChatMessage, deleteChatMessage, deleteChatMessagesFrom, deleteChatMessagesByIds, retractChatMessage, editChatMessage, updateMessageMediaData, replaceResponseBatchWithParts, replaceGroupResponseRound, isReadingDiscussMessage, isSystemInstructionMessage, createResponseBatchId, createResponseRoundId, getLatestStateValues, getLatestCharacterStateValues, compareChatMessages } from "@/lib/chat-storage";
+import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL_VISIBLE_MESSAGE_COUNT, CHAT_LOAD_MORE_MESSAGE_COUNT, CHAT_REQUEST_REPLY_EVENT, loadChatAppSettings, loadChatMessages, loadChatContacts, loadChatSessions, saveChatSessions, pushChatMessage, updateChatMessage, deleteChatMessage, deleteChatMessagesFrom, deleteChatMessagesByIds, retractChatMessage, editChatMessage, updateMessageMediaData, replaceResponseBatchWithParts, replaceGroupResponseRound, isReadingDiscussMessage, isSystemInstructionMessage, createResponseBatchId, createResponseRoundId, getLatestStateValues, getLatestCharacterStateValues, compareChatMessages } from "@/lib/chat-storage";
 import type { StateValue } from "@/lib/chat-storage";
 import { parseStateValues, mergeStateValues } from "@/lib/state-value-parser";
 import { parseAIResponse, type ParsedMessagePart } from "@/lib/rich-message-parser";
@@ -68,11 +68,10 @@ import { scrollElementWithinContainer } from "@/lib/dom-scroll";
 import { ChatFallbackAvatar } from "./chat-fallback-avatar";
 import { ChatScreenEffectOverlay, type ActiveScreenEffect } from "./chat-screen-effect";
 import {
-    consumePendingChatDiceFace,
     formatChatDiceResultMessage,
+    isDiceOnlyMessage,
     matchChatScreenEffectRule,
     rollChatDiceFace,
-    setPendingChatDiceFace,
 } from "@/lib/chat-screen-effects";
 import { abortableDelay, throwIfAborted } from "@/lib/abort-utils";
 import { GROUP_SELF_KEY, canGroupAdminAct, applyGroupAdminAction, buildGroupAdminNoticeText, getGroupMemberDisplayName, getGroupMuteRemainingMs, getGroupRole, isGroupMuted, formatMuteRemainingLabel, resolveGroupMemberKeyByName, type GroupAdminAction } from "@/lib/group-admin";
@@ -155,6 +154,7 @@ const OfflineAssistantTextBlock = memo(function OfflineAssistantTextBlock({
 
 const CHAT_VISUAL_MEDIA_TYPES = new Set([
     "sticker",
+    "dice",
     "red_packet",
     "transfer",
     "payment_request",
@@ -202,6 +202,7 @@ function getWeixinCloudDeleteTargetCount(messages: ChatMessage[]): number {
 
 const CHAT_MEDIA_BUBBLE_TYPES = new Set([
     "sticker",
+    "dice",
     "red_packet",
     "transfer",
     "payment_request",
@@ -1094,28 +1095,44 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         for (const msg of messages) {
             if (seen.has(msg.id)) continue;
             seen.add(msg.id);
-            if (fired) continue;
             if (msg.role !== "user" && msg.role !== "assistant") continue;
-            if (msg.mediaType || !msg.content) continue;
             // 只对本次打开聊天室之后产生的消息生效，历史加载/翻页不触发
             if (new Date(msg.createdAt).getTime() < screenFxMountedAtRef.current) continue;
+            // 骰子气泡：气泡自己翻滚定格，这里同步播全屏骰子（点数一致）
+            if (msg.mediaType === "dice") {
+                if (fired) continue;
+                const face = Math.min(6, Math.max(1, Number(msg.mediaData?.diceFace) || 1));
+                setActiveScreenEffect({ runId: msg.id, effect: "dice", emojis: "", diceFace: face });
+                fired = true;
+                continue;
+            }
+            if (msg.mediaType || !msg.content) continue;
             const hit = matchChatScreenEffectRule(msg.content);
             if (!hit) continue;
-            let diceFace: number | undefined;
             if (hit.effect === "dice") {
-                // 发送管线可能已掷好点数；角色触发时在这里掷，并写旁白公布结果
-                diceFace = consumePendingChatDiceFace() ?? undefined;
-                if (diceFace === undefined) {
-                    diceFace = rollChatDiceFace();
-                    const diceMsg = pushChatMessage({
-                        sessionId: session.id,
-                        role: "system",
-                        content: formatChatDiceResultMessage(diceFace),
-                    });
-                    setMessages(prev => [...prev, diceMsg]);
+                // 单独一条骰子图标（角色发的）：原地转成骰子气泡（内容保持图标），
+                // 点数由系统旁白公布，避免结果挂在角色消息上被模仿
+                const face = rollChatDiceFace();
+                const patch = {
+                    mediaType: "dice" as const,
+                    mediaData: { ...msg.mediaData, diceFace: face },
+                };
+                updateChatMessage(msg.id, patch);
+                setMessages(prev => prev.map(m => (m.id === msg.id ? { ...m, ...patch } : m)));
+                const diceAside = pushChatMessage({
+                    sessionId: session.id,
+                    role: "system",
+                    content: formatChatDiceResultMessage(face),
+                });
+                setMessages(prev => [...prev, diceAside]);
+                if (!fired) {
+                    setActiveScreenEffect({ runId: msg.id, effect: "dice", emojis: "", diceFace: face });
+                    fired = true;
                 }
+                continue;
             }
-            setActiveScreenEffect({ runId: msg.id, ...hit, diceFace });
+            if (fired) continue;
+            setActiveScreenEffect({ runId: msg.id, ...hit });
             fired = true;
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3604,25 +3621,27 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         } : undefined;
         setQuotingMessage(null);
 
+        // 掷骰子：整条消息就是骰子图标时，发骰子气泡（内容仅图标），
+        // 点数由系统旁白公布——避免结果挂在 user 消息上被角色模仿格式
+        const diceOnly = !isQuoting && isDiceOnlyMessage(currentText);
+        const diceFace = diceOnly ? rollChatDiceFace() : 0;
+
         const newMsg = pushChatMessage({
             sessionId: session.id,
             role: "user",
             content: currentText,
-            mediaType: isQuoting ? "quote" : undefined,
-            mediaData: isQuoting ? quoteData : undefined,
+            mediaType: diceOnly ? "dice" : isQuoting ? "quote" : undefined,
+            mediaData: diceOnly ? { diceFace } : isQuoting ? quoteData : undefined,
         });
 
         setMessages(prev => [...prev, newMsg]);
-        // 掷骰子：点数在进入生成前掷好并写成旁白，让角色本轮就能对结果做出回应
-        if (matchChatScreenEffectRule(currentText)?.effect === "dice") {
-            const face = rollChatDiceFace();
-            setPendingChatDiceFace(face);
-            const diceMsg = pushChatMessage({
+        if (diceOnly) {
+            const diceAside = pushChatMessage({
                 sessionId: session.id,
                 role: "system",
-                content: formatChatDiceResultMessage(face),
+                content: formatChatDiceResultMessage(diceFace),
             });
-            setMessages(prev => [...prev, diceMsg]);
+            setMessages(prev => [...prev, diceAside]);
         }
         setPendingGenerate(true);
         return true;
@@ -5345,7 +5364,12 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                         onContextMenu={(e) => { e.preventDefault(); openMessageContextMenu(msg.id, { x: e.clientX, y: e.clientY }); }}
                                         className={isSystemInstruction
                                             ? "chat-system-instruction-card relative cursor-pointer"
-                                            : "chat-sys-msg break-all max-w-[90%] relative cursor-pointer"}
+                                            : `chat-sys-msg break-all max-w-[90%] relative cursor-pointer${
+                                                // 骰子旁白：等骰子落定再淡入，避免剧透点数
+                                                msg.content.startsWith("🎲 掷出了") && Date.now() - new Date(msg.createdAt).getTime() < 6000
+                                                    ? " dice-aside-reveal"
+                                                    : ""
+                                            }`}
                                         {...(activeMessageId === msg.id ? { "data-active": "" } : {})}
                                     >
                                         {isSystemInstruction ? (
